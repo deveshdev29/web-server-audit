@@ -5,21 +5,22 @@ import requests
 import streamlit as st
 import os
 import io
+import re
 from docx import Document
 
+# streamlit session init
 if "docx_file" not in st.session_state:
     st.session_state.docx_file = None
 
-
-# === Vulnerability mapping ===
+# vulnerability mapping
 nist_mappings = {
-    "Apache/2.4.7": "CVE-2021-41773: Path traversal vulnerability in Apache HTTP Server 2.4.49 (fixed in later versions).",
+    "Apache/2.4.7": "CVE-2021-41773: Path traversal vulnerability in Apache HTTP Server 2.4.49.",
     "X-Frame-Options header is not present": "Potential clickjacking vulnerability.",
     "X-Content-Type-Options header is not set": "Risk of MIME type confusion attacks.",
     "mod_negotiation is enabled": "May allow attackers to brute force filenames (CVE-2009-1195)."
 }
 
-# === Helper Functions ===
+# functions
 def run_command(command):
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
@@ -40,12 +41,19 @@ def check_ssl(target):
             with context.wrap_socket(sock, server_hostname=target) as ssock:
                 cert = ssock.getpeercert()
                 return (f"Issuer: {cert.get('issuer')}\nValid from: {cert.get('notBefore')}\nValid until: {cert.get('notAfter')}")
-    except Exception as e:
+    except socket.gaierror:
+        return "SSL check failed: Invalid hostname or DNS error."
+    except ConnectionRefusedError:
+        return "SSL check failed: Port 443 is closed on the target."
+    except socket.timeout:
+        return "SSL check failed: Connection timed out."
+    except OSError as e:
         return f"SSL check failed: {e}"
+
 
 def check_http_headers(target):
     try:
-        response = requests.get(f"https://{target}", timeout=10, verify=True)
+        response = requests.get(f"http://{target}", timeout=10, verify=True)
         headers = response.headers
         report = ""
         for header in ["Strict-Transport-Security", "Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options"]:
@@ -54,12 +62,36 @@ def check_http_headers(target):
     except Exception as e:
         return f"Header check failed: {e}"
 
-def analyze_findings(findings):
-    recommendations = []
-    for finding, recommendation in nist_mappings.items():
-        if finding.lower() in findings.lower():
-            recommendations.append(f"Issue: {finding}\nRecommendation: {recommendation}")
-    return "\n\n".join(recommendations) if recommendations else "No critical vulnerabilities found."
+def simple_vulnerability_analysis(nmap_output, nikto_output, header_output):
+    findings = []
+
+    apache_match = re.search(r"Apache/2\.4\.\d+", nmap_output)
+    if apache_match:
+        version = apache_match.group(0)
+        findings.append(f"{version} detected. Check for known vulnerabilities.")
+
+    for line in header_output.splitlines():
+        if "NOT present" in line:
+            findings.append(f"Missing header: {line.split(':')[0]}. Potential risk.")
+
+    if "mod_negotiation" in nikto_output:
+        findings.append("mod_negotiation enabled. Might be vulnerable to CVE-2009-1195.")
+
+    if "Server leaks inodes" in nikto_output:
+        findings.append("Nikto detected inode information disclosure.")
+
+    if "OSVDB-" in nikto_output:
+        findings.append("Nikto reported vulnerabilities (OSVDB references found).")
+
+    vuln_matches = re.findall(r"(CVE-\d{4}-\d{4,7})", nikto_output + nmap_output)
+    for cve in set(vuln_matches):
+        findings.append(f"Detected {cve}. Check NIST database for details.")
+
+    if not findings:
+        return "No critical vulnerabilities detected."
+
+    return "\n".join([f"- {issue}" for issue in findings])
+
 
 def save_report(nmap_output, nikto_output, ssl_output, header_output, analysis):
     try:
@@ -71,14 +103,14 @@ def save_report(nmap_output, nikto_output, ssl_output, header_output, analysis):
             ("Nikto Scan Results", nikto_output),
             ("SSL Certificate Information", ssl_output),
             ("HTTP Security Header Check", header_output),
-            ("Analysis and Recommendations", analysis),
-            ("Automated Suggestions", 
+            ("Analysis and Vulnerability Summary", analysis),
+            ("Recommended Actions", 
              "- Update outdated services.\n"
              "- Enable HTTP security headers.\n"
              "- Disable unnecessary modules.\n"
-             "- Regularly monitor CVEs and patch promptly.\n"
-             "- Use strong ciphers and review SSL configurations.\n"
-             "- Periodically perform vulnerability scans and penetration tests.")
+             "- Monitor CVEs and patch frequently.\n"
+             "- Use strong SSL configurations.\n"
+             "- Perform periodic security scans.")
         ]
 
         for title, content in sections:
@@ -92,12 +124,10 @@ def save_report(nmap_output, nikto_output, ssl_output, header_output, analysis):
 
     except Exception as e:
         st.error(f"Report generation failed: {e}")
-        print(f"[DEBUG] Report generation failed: {e}")
         return None
 
-
-# === Streamlit UI ===
-st.title("🔒 Web Server Security Auditor")
+# streamlit ui
+st.title("Web Server Security Auditor")
 
 target = st.text_input("Enter target domain or IP (without https://):")
 
@@ -119,12 +149,12 @@ if st.button("Run Audit") and target:
     st.text_area("HTTP Headers", st.session_state.header_result, height=150)
 
     with st.spinner("Analyzing Findings..."):
-        st.session_state.analysis = analyze_findings(
-            st.session_state.nmap_result +
-            st.session_state.nikto_result +
+        st.session_state.analysis = simple_vulnerability_analysis(
+            st.session_state.nmap_result,
+            st.session_state.nikto_result,
             st.session_state.header_result
         )
-    st.text_area("Analysis and Recommendations", st.session_state.analysis, height=200)
+    st.text_area("Vulnerability Analysis", st.session_state.analysis, height=200)
 
 if (
     "nmap_result" in st.session_state and
@@ -133,7 +163,7 @@ if (
     "header_result" in st.session_state and
     "analysis" in st.session_state
 ):
-    if st.button("🛠️ Generate DOCX Report"):
+    if st.button("Generate DOCX Report"):
         docx_file = save_report(
             st.session_state.nmap_result,
             st.session_state.nikto_result,
@@ -143,7 +173,7 @@ if (
         )
         if docx_file:
             st.download_button(
-                label="📥 Download Audit Report",
+                label="Download Audit Report",
                 data=docx_file,
                 file_name="audit_report.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
